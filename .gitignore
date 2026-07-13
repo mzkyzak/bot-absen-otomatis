@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+
+# Environment variables (rahasia!)
+.env
+
+# Firebase Service Account Key (SANGAT RAHASIA — jangan pernah commit!)
+serviceAccountKey.json
+
+# Sesi WhatsApp (berisi token login, jangan commit)
+wa-session/
+
+# Log files
+*.log
+npm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary images
+screenshots/
+
+# Extra Firebase Keys
+device-streaming-d7bccff2-firebase-adminsdk-fbsvc-dcbfaba05e.json

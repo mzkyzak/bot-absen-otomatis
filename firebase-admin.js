@@ -1,6 +1,4 @@
-// =====================================================
 // Firebase Admin SDK — Koneksi ke Firebase dari Server
-// =====================================================
 const admin = require("firebase-admin");
 const path = require("path");
 require("dotenv").config();

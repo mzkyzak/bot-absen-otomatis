@@ -107,5 +107,5 @@ Bot ini mengadopsi sistem keamanan **Strict Whitelisting** (Eksklusif / Privat).
 
 ---
 <div align="center">
-  <p><i>Engineered with ❤️ for seamless Internship Management</i></p>
+  <p><i>Full Stack Developer | Creating Internship Management with Taufiq Ikhsan muzaky (mzkyzak) ❤️</i></p>
 </div>

@@ -1,12 +1,5 @@
-// =====================================================
-// 🤖 Bot WA Absen Otomatis — PKL Dashboard
-// =====================================================
-// Cara pakai:
-//   1. npm install
-//   2. Isi .env (copy dari .env.example)
-//   3. node index.js → scan QR code dari HP
-//   4. Kirim foto ke nomor bot dengan caption "absen"
-// =====================================================
+// bot wa absen khusus  my portfolio 
+// secara otomatis sinkronisasi ke firebase melalui chat whatsapp
 
 require("dotenv").config();
 const baileys = require("@whiskeysockets/baileys");
@@ -43,7 +36,7 @@ const BOT_AUTHOR = "mzkyzak";
 const KEYWORD_ABSEN = (process.env.KEYWORD_ABSEN || "absen").toLowerCase();
 
 // Whitelist: HANYA nomor di ALLOWED_NUMBERS yang bisa pakai bot
-// Format di .env: 628xxx (tanpa +), pisah koma jika banyak
+// Format di .env: 685810192529
 const ALLOWED_NUMBERS = (process.env.ALLOWED_NUMBERS || "")
   .split(",")
   .map((n) => n.trim().replace(/[^0-9]/g, ""))

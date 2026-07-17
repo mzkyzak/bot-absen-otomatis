@@ -21,6 +21,7 @@ const {
 const { Boom } = require("@hapi/boom");
 const qrcode = require("qrcode-terminal");
 const pino = require("pino");
+const { spawn } = require("child_process");
 const {
   initFirebase,
   uploadPhoto,
@@ -31,6 +32,7 @@ const {
 } = require("./firebase-admin");
 
 const unauthorizedWarnCount = new Map();
+const pendingDokumentasi = new Map();
 
 // ─── Branding ─────────────────────────────────────────
 const BOT_NAME = "Bot PKL by mzkyzak";
@@ -363,6 +365,61 @@ async function startBot() {
     return R * c; // Jarak dalam meter
   }
 
+  // ─── Helper: Inject metadata stiker ke dalam WebP (EXIF) ─────
+  // Info pack name & publisher muncul saat user tap stiker di WA
+  async function tambahMetadataStiker(webpBuf, packName = "Developer(❤️) by:mzkyzak", publisher = "mzkyzak") {
+    const webpmux = require("node-webpmux");
+    const img = new webpmux.Image();
+    await img.load(webpBuf);
+
+    const json = {
+      "sticker-pack-id": "com.mzkyzak.bot.stickers",
+      "sticker-pack-name": packName,
+      "sticker-pack-publisher": publisher,
+      "emojis": ["🎭"]
+    };
+
+    const exif = Buffer.concat([
+      Buffer.from([0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x41, 0x57, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x16, 0x00, 0x00, 0x00]),
+      Buffer.from(JSON.stringify(json), "utf-8")
+    ]);
+    exif.writeUIntLE(Buffer.from(JSON.stringify(json), "utf-8").length, 14, 4);
+
+    img.exif = exif;
+    return await img.save(null);
+  }
+
+  // ─── Helper: Buat stiker WA (resize 512×512 WebP + metadata pack) ─
+  async function buatStiker(imageBuffer) {
+    // Solusi anti-error Termux/Android: Menggunakan FFmpeg bawaan system alih-alih sharp
+    const webpBuf = await new Promise((resolve, reject) => {
+      const ffmpeg = spawn("ffmpeg", [
+        "-i", "pipe:0",
+        "-vcodec", "libwebp",
+        "-vf", "scale='min(512,iw)':min'(512,ih)':force_original_aspect_ratio=decrease,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=black@0",
+        "-f", "webp",
+        "-q:v", "80",
+        "pipe:1"
+      ]);
+
+      const chunks = [];
+      ffmpeg.stdout.on("data", (chunk) => chunks.push(chunk));
+      
+      ffmpeg.on("close", (code) => {
+        if (code === 0) resolve(Buffer.concat(chunks));
+        else reject(new Error("FFmpeg gagal dengan kode " + code + ". Pastikan ffmpeg sudah diinstall (pkg install ffmpeg)."));
+      });
+      ffmpeg.on("error", (err) => reject(new Error("FFmpeg tidak ditemukan: " + err.message)));
+
+      ffmpeg.stdin.write(imageBuffer);
+      ffmpeg.stdin.end();
+    });
+
+    // Inject metadata (pack name & publisher) ke EXIF WebP
+    return await tambahMetadataStiker(webpBuf, "love mzkyzak", "mzkyzak");
+  }
+
+
   // ─── Event: Pesan Masuk ───────────────────────────
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     // DEBUG: log semua event masuk (hapus setelah debug selesai)
@@ -447,64 +504,60 @@ async function startBot() {
       );
 
       // ─── Cek whitelist ─────────────────────────────
-      // Hanya nomor di ALLOWED_NUMBERS yang bisa pakai semua fitur bot
-      if (!isPengirimDiizinkan(senderNomor)) {
-        // Jika LID belum terpeta ke nomor, skip diam-diam (bukan reject)
+      const isAllowed = isPengirimDiizinkan(senderNomor);
+      
+      const displayNomor = senderNomor ?? senderJid;
+      const textMessage =
+        msg.message?.conversation ||
+        msg.message?.extendedTextMessage?.text ||
+        msg.message?.imageMessage?.caption ||
+        "";
+      const textLower = textMessage.toLowerCase().trim();
+
+      // Kategori perintah yang KHUSUS PRIBADI (Privat)
+      const isPrivatCmd = 
+        textLower.startsWith("absen") || 
+        textLower.startsWith("jurnal") || 
+        textLower.startsWith("dokumentasi") || 
+        textLower.startsWith("dokum") || 
+        textLower.startsWith("sakit") || 
+        textLower.startsWith("izin") || 
+        textLower.startsWith("tugas");
+
+      const locationMessage = msg.message?.locationMessage || msg.message?.liveLocationMessage;
+      const isPendingAbsen = pendingAbsen.has(senderJid) || pendingLocation.has(senderJid);
+
+      // Blokir JIKA user TIDAK TERDAFTAR mencoba mengakses fitur PRIVAT
+      if (!isAllowed && (isPrivatCmd || locationMessage || isPendingAbsen)) {
         if (senderNomor === null && senderJid.endsWith("@lid")) {
           console.log(`⏭️  Skip @lid belum terpeta: ${senderJid}`);
           continue;
         }
-        const displayNomor = senderNomor ?? senderJid;
-        const textMessage =
-          msg.message?.conversation ||
-          msg.message?.extendedTextMessage?.text ||
-          msg.message?.imageMessage?.caption ||
-          "";
-        const textLower = textMessage.toLowerCase().trim();
 
-        if (
-          textLower === "bantuan" ||
-          textLower === "help" ||
-          textLower === "menu" ||
-          textLower === "info"
-        ) {
-          const warnCount = unauthorizedWarnCount.get(senderJid) || 0;
-          if (warnCount < 2) {
-            unauthorizedWarnCount.set(senderJid, warnCount + 1);
-            const { hari, tanggal, jam } = getTanggalHari();
-            await sock.sendMessage(senderJid, {
-              text:
-                `⚠️ *AKSES DITOLAK (PRIVATE BOT)*\n\n` +
-                `╔══════════════════════╗\n` +
-                `  🤖 *${process.env.BOT_NAME || "Bot Absen PKL"}*\n` +
-                `  v2.0 — PKL BPS Pusat\n` +
-                `╚══════════════════════╝\n\n` +
-                `📅 *Hari ini:* ${hari}, ${tanggal}\n` +
-                `🕐 *Jam:* ${jam} WIB\n` +
-                `👤 *Nomor Anda:* ${formatNomorTampil(displayNomor)}\n\n` +
-                `⛔ *PERINGATAN YAHH INI NOMORNYA BEDA:*\n` +
-                `Bot ini bersifat **SANGAT RAHASIA** dan hanya melayani nomor admin yang terdaftar di dalam sistem.\n\n` +
-                `Nomor Anda **TIDAK TERDAFTAR**.\n` +
-                `Jika Anda mencoba mengirim pesan lebih dari 2 kali, nomor Anda akan diblokir otomatis oleh sistem keamanan bot.\n\n` +
-                `_Sistem Keamanan Aktif 🛡️_`,
-            });
-            console.log(
-              `⚠️ Peringatan terkirim ke unregistered (${warnCount + 1}/2): ${displayNomor}`,
-            );
-          } else {
-            console.log(
-              `⛔ Limit peringatan bantuan (silent): ${displayNomor}`,
-            );
-          }
+        const warnCount = unauthorizedWarnCount.get(senderJid) || 0;
+        if (warnCount < 2) {
+          unauthorizedWarnCount.set(senderJid, warnCount + 1);
+          const { hari, tanggal, jam } = getTanggalHari();
+          await sock.sendMessage(senderJid, {
+            text:
+              `⚠️ *AKSES DITOLAK (PRIVATE BOT)*\n\n` +
+              `╔══════════════════════╗\n` +
+              `  🤖 *${process.env.BOT_NAME || "Bot Absen PKL"}*\n` +
+              `  v2.0 — PKL BPS Pusat\n` +
+              `╚══════════════════════╝\n\n` +
+              `📅 *Hari ini:* ${hari}, ${tanggal}\n` +
+              `🕐 *Jam:* ${jam} WIB\n` +
+              `👤 *Nomor Anda:* ${formatNomorTampil(displayNomor)}\n\n` +
+              `⛔ *PERINGATAN:* Fitur Absen, Jurnal, dan Dokumentasi bersifat **SANGAT RAHASIA** dan hanya melayani nomor admin.\n\n` +
+              `_Catatan: Kamu tetap bisa menggunakan fitur Publik seperti *stiker* 🎭._`,
+          });
+          console.log(`⚠️ Peringatan terkirim ke unregistered (${warnCount + 1}/2): ${displayNomor}`);
         } else {
-          console.log(`⛔ Akses ditolak (silent): ${displayNomor}`);
+          console.log(`⛔ Limit peringatan (silent): ${displayNomor}`);
         }
         continue;
       }
-
-      // ─── Cek apakah pesan berisi LOKASI WA 📍 ──────
-      const locationMessage =
-        msg.message?.locationMessage || msg.message?.liveLocationMessage;
+      // Cek lokasi WA (sudah didefinisikan di atas)
       if (locationMessage) {
         const lat = locationMessage.degreesLatitude;
         const lon = locationMessage.degreesLongitude;
@@ -526,12 +579,102 @@ async function startBot() {
         msg.message?.viewOnceMessageV2?.message?.imageMessage;
       const imageMessage = isImageMessage || isViewOnceImage;
 
-      // ─── Cek pesan TEKS (untuk jurnal tanpa foto) ──
-      const textMessage =
-        msg.message?.conversation ||
-        msg.message?.extendedTextMessage?.text ||
-        "";
-      const textLower = textMessage.toLowerCase().trim();
+      // ─── Cek pesan TEKS sudah di-handle di atas (textMessage & textLower) ──
+
+      // ─── REPLY "S" / "s" → buat stiker dari foto yang di-reply ────
+      // Cek apakah pesan ini adalah reply ke pesan lain
+      const quotedMsg =
+        msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
+      if ((textLower === "s") && quotedMsg) {
+        // Ambil foto dari quoted message
+        const quotedImage =
+          quotedMsg?.imageMessage ||
+          quotedMsg?.viewOnceMessageV2?.message?.imageMessage;
+        if (quotedImage) {
+          console.log(`🎭 Reply-S stiker dari ${senderNomor}`);
+          try {
+            // Reconstruct pesan yang di-quote agar bisa di-download
+            const fakeMsg = {
+              key: msg.key,
+              message: quotedMsg,
+            };
+            const imgBuf = await downloadMediaMessage(
+              fakeMsg,
+              "buffer",
+              {},
+              {
+                logger: pino({ level: "silent" }),
+                reuploadRequest: sock.updateMediaMessage,
+              },
+            );
+            const stickerBuf = await buatStiker(imgBuf);
+            await sock.sendMessage(senderJid, { sticker: stickerBuf });
+            console.log(`✅ Reply-S stiker terkirim ke ${senderNomor}`);
+          } catch (e) {
+            console.error("❌ Gagal buat stiker dari reply:", e.message);
+            await sock.sendMessage(senderJid, {
+              text: "❌ Gagal membuat stiker. Coba reply ulang fotonya ya!",
+            });
+          }
+          continue;
+        }
+      }
+
+      // ─── REPLY "toimg" / "toimage" → ubah stiker ke foto ────
+      if ((textLower === "toimg" || textLower === "toimage") && quotedMsg) {
+        const quotedSticker = quotedMsg?.stickerMessage;
+        if (quotedSticker) {
+          console.log(`🖼️ Reply-toimg dari ${senderNomor}`);
+          try {
+            const fakeMsg = {
+              key: msg.key,
+              message: quotedMsg,
+            };
+            const stickerBuf = await downloadMediaMessage(
+              fakeMsg,
+              "buffer",
+              {},
+              {
+                logger: pino({ level: "silent" }),
+                reuploadRequest: sock.updateMediaMessage,
+              }
+            );
+
+            // Konversi stiker (webp) menjadi gambar (png) menggunakan FFmpeg agar support di Termux
+            const imgBuf = await new Promise((resolve, reject) => {
+              const ffmpeg = spawn("ffmpeg", [
+                "-i", "pipe:0",
+                "-vcodec", "png",
+                "-f", "image2",
+                "pipe:1"
+              ]);
+              const chunks = [];
+              ffmpeg.stdout.on("data", (chunk) => chunks.push(chunk));
+              ffmpeg.on("close", (code) => {
+                if (code === 0) resolve(Buffer.concat(chunks));
+                else reject(new Error("Gagal convert to PNG."));
+              });
+              ffmpeg.on("error", (err) => reject(new Error("FFmpeg error: " + err.message)));
+              ffmpeg.stdin.write(stickerBuf);
+              ffmpeg.stdin.end();
+            });
+
+            await sock.sendMessage(
+              senderJid,
+              { image: imgBuf, caption: "Ini fotonya! 📸" },
+              { quoted: msg }
+            );
+            console.log(`✅ Reply-toimg terkirim ke ${senderNomor}`);
+          } catch (e) {
+            console.error("❌ Gagal merubah stiker menjadi foto:", e.message);
+            await sock.sendMessage(senderJid, {
+              text: "❌ Gagal merubah stiker menjadi foto. Pastikan stiker statis (bukan animasi).",
+            });
+          }
+          continue;
+        }
+      }
+
       if (textMessage && !imageMessage) {
         // ─── Helper: parse priority dari awal teks ─────
         const parsePriority = (kata, teks) => {
@@ -691,7 +834,7 @@ async function startBot() {
           const pEmoji = { Tinggi: "🔴", Sedang: "🟡", Rendah: "🟢" }[priority];
 
           try {
-            const jurnalResult = await tambahJurnal({ aktivitas, priority, tanggal });
+            const jurnalResult = await tambahJurnal({ aktivitas, priority, tanggal, pengirim: senderNomor });
             if (!jurnalResult.success && jurnalResult.alreadyExists) {
               await sock.sendMessage(senderJid, {
                 text: `⚠️ *Jurnal Sudah Diisi!*\n\nKamu sudah mengisi jurnal hari ini:\n📌 *"${jurnalResult.existingTitle}"*\n\nJurnal hanya bisa diisi *1 kali per hari*.`,
@@ -724,11 +867,18 @@ async function startBot() {
           const pEmoji = { Tinggi: "🔴", Sedang: "🟡", Rendah: "🟢" }[priority];
 
           try {
-            await tambahTugas({ judul: judulTugas, priority, tanggal });
-            await sock.sendMessage(senderJid, {
-              text: `📋 *Tugas PKL Ditambahkan!*\n\n📌 *Tugas:* ${judulTugas}\n📅 *Tanggal:* ${tanggal}\n${pEmoji} *Prioritas:* ${priority}\n⏳ *Status:* Menunggu\n\n_Tugas sudah muncul di dashboard! ✅_`,
-            });
-            console.log(`📋 Tugas: "${judulTugas}" [${priority}]`);
+            const tugasResult = await tambahTugas({ judul: judulTugas, priority, tanggal, pengirim: senderNomor });
+            if (!tugasResult.success && tugasResult.alreadyExists) {
+              await sock.sendMessage(senderJid, {
+                text: `⚠️ *Tugas Sudah Diisi!*\n\nKamu sudah menambahkan tugas hari ini:\n📌 *"${tugasResult.existingTitle}"*\n\nTugas harian hanya bisa ditambahkan *1 kali per hari*.`,
+              });
+              console.log(`⏩ Tugas sudah ada hari ini untuk ${senderNomor}`);
+            } else {
+              await sock.sendMessage(senderJid, {
+                text: `📋 *Tugas PKL Ditambahkan!*\n\n📌 *Tugas:* ${judulTugas}\n📅 *Tanggal:* ${tanggal}\n${pEmoji} *Prioritas:* ${priority}\n⏳ *Status:* Menunggu\n\n_Tugas sudah muncul di dashboard! ✅_`,
+              });
+              console.log(`📋 Tugas: "${judulTugas}" [${priority}]`);
+            }
           } catch (error) {
             console.error("❌ Gagal tambah tugas ke Firebase:", error);
             await sock.sendMessage(senderJid, {
@@ -736,18 +886,7 @@ async function startBot() {
             });
           }
 
-          // ─── ABSEN E-PRAKERIN SEKOLAH 🏫 ─────────────────
-        } else if (
-          textLower === "eprakerin" ||
-          textLower === "e-prakerin" ||
-          textLower === "absen sekolah" ||
-          textLower === "absen eprakerin" ||
-          textLower.startsWith("jurnal eprakerin") ||
-          textLower.startsWith("jurnal sekolah")
-        ) {
-          await sock.sendMessage(senderJid, {
-            text: `❌ *DITOLAK!* Wajib pakai lampiran 📷 FOTO buat absen atau jurnal E-Prakerin.`,
-          });
+
           // ─── END ─────────────────────────────────────────
 
           // ─── PING / STATUS BOT 🤖 ─────────────────────────
@@ -810,6 +949,10 @@ async function startBot() {
               `• Cukup kirim pesan teks (tanpa foto):\n` +
               `  › *tugas [keterangan]*\n` +
               `  › *tugas tinggi / sedang / rendah [keterangan]*\n\n` +
+              `🎭 *STIKER OTOMATIS*\n` +
+              `_Konversi foto jadi stiker WhatsApp secara instan._\n` +
+              `• Kirim foto apapun dengan caption: *stiker*\n` +
+              `• Bot langsung balas dengan stiker siap pakai! ✨\n\n` +
               `━━━━━━━━━━━━━━━━━━━━━━\n` +
               `⚙️ _Sistem Kompresi Gambar: Smart HD (max ~900KB)_\n` +
               `🔒 _Bot ini privat dan terenkripsi — hanya melayani nomor admin terdaftar._\n` +
@@ -831,22 +974,45 @@ async function startBot() {
       const isJurnal = caption.startsWith("jurnal");
       const isSakit = caption.startsWith("sakit");
       const isIzin = caption.startsWith("izin");
+      const isStiker =
+        caption === "stiker" ||
+        caption === "sticker" ||
+        caption === "s" ||
+        caption.startsWith("stiker ") ||
+        caption.startsWith("sticker ");
 
       // ─── Tidak ada keyword yang dikenal ────────────
-      if (!isAbsen && !isDokumentasi && !isJurnal && !isSakit && !isIzin) {
+      if (!isAbsen && !isDokumentasi && !isJurnal && !isSakit && !isIzin && !isStiker && !pendingDokumentasi.has(senderJid)) {
         if (
           caption.includes("cek") ||
           caption.includes("menu") ||
-          caption.includes("help")
+          caption.includes("help") ||
+          caption.includes("bantuan") ||
+          textLower === "bantuan" ||
+          textLower === "menu" ||
+          textLower === "help"
         ) {
-          await sock.sendMessage(senderJid, {
-            text: `🤖 *Bot PKL — Menu Bantuan (v2.0)*\n\n*📋 Absen Portfolio Dashboard:*\n• Foto + caption *absen*\n\n*💊 Sakit / Izin:*\n• Foto + caption *sakit [alasan]*\n\n*🖼️ Dokumentasi:*\n• Foto + caption *dokumentasi [judul]*\n\n*📝 Jurnal Dashboard Firebase:*\n• Teks saja: *jurnal [aktivitas]*\n\nKetik *bantuan* untuk info lengkap.`,
-          });
+          if (!isAllowed) {
+            await sock.sendMessage(senderJid, {
+              text: `🤖 *Bot Stiker Otomatis*\n\nKirimkan foto dengan caption *stiker* atau balas foto dengan *s* untuk mengubahnya menjadi stiker WhatsApp! 🎭`,
+            });
+          } else {
+            await sock.sendMessage(senderJid, {
+              text: `🤖 *Bot PKL — Menu Bantuan (v2.0)*\n\n*📋 Absen Portfolio Dashboard:*\n• Foto + caption *absen*\n\n*💊 Sakit / Izin:*\n• Foto + caption *sakit [alasan]*\n\n*🖼️ Dokumentasi:*\n• Foto + caption *dokumentasi [judul]*\n\n*📝 Jurnal Dashboard Firebase:*\n• Teks saja: *jurnal [aktivitas]*\n\n*🎭 Stiker Otomatis:*\n• Foto + caption *stiker*\n\nKetik *bantuan* untuk info lengkap.`,
+            });
+          }
           continue;
         }
-        await sock.sendMessage(senderJid, {
-          text: `📸 *Foto diterima!*\n\nGunakan caption:\n• *absen* — absen ke portfolio dashboard\n• *sakit [keterangan]* — ajukan sakit\n• *izin [keterangan]* — ajukan izin\n• *dokumentasi [judul]* — simpan ke galeri\n\nKetik *bantuan* untuk info lengkap 📋`,
-        });
+        
+        if (!isAllowed) {
+          await sock.sendMessage(senderJid, {
+            text: `📸 *Foto diterima!*\n\nGunakan caption *stiker* untuk mengubah foto ini menjadi stiker WA 🎭`,
+          });
+        } else {
+          await sock.sendMessage(senderJid, {
+            text: `📸 *Foto diterima!*\n\nGunakan caption:\n• *absen* — absen ke portfolio dashboard\n• *sakit [keterangan]* — ajukan sakit\n• *izin [keterangan]* — ajukan izin\n• *dokumentasi [judul]* — simpan ke galeri\n• *stiker* — jadiin stiker WA 🎭\n\nKetik *bantuan* untuk info lengkap 📋`,
+          });
+        }
         continue;
       }
 
@@ -854,8 +1020,11 @@ async function startBot() {
 
       console.log(`\n📥 Pesan dari: ${senderNomor} | caption: "${caption}"`);
 
-      // ─── Download foto (dipakai absen & dokumentasi) ─
-      await sock.sendMessage(senderJid, { text: "⏳ _Memproses..._" });
+      // ─── Download foto (dipakai semua fitur berbasis foto) ─
+      // Untuk stiker: skip pesan loading agar lebih responsif
+      if (!isStiker) {
+        await sock.sendMessage(senderJid, { text: "⏳ _Memproses..._" });
+      }
 
       let imageBuffer = null;
       try {
@@ -880,22 +1049,95 @@ async function startBot() {
 
       try {
         // ═══════════════════════════════════
-        // 🖼️ DOKUMENTASI
+        // 🎭 STIKER OTOMATIS
         // ═══════════════════════════════════
-        if (isDokumentasi) {
-          // Ambil judul dari caption (setelah kata "dokumentasi")
-          const judulMatch =
-            captionAsli.match(/dokumentasi\s*(.*)/i) ||
-            captionAsli.match(/dokum\s*(.*)/i);
-          const judul = judulMatch?.[1]?.trim() || `Dokumentasi ${tanggal} `;
+        if (isStiker) {
+          console.log(`🎭 Membuat stiker untuk ${senderNomor}...`);
 
-          console.log(`🖼️ Menyimpan dokumentasi: "${judul}"`);
-          await tambahDokumentasi({ imageBuffer, judul, tanggal });
+          // Konversi foto → WebP 512x512 + watermark
+          const stickerBuffer = await buatStiker(imageBuffer);
 
+          // Kirim sebagai stiker
           await sock.sendMessage(senderJid, {
-            text: `🖼️ * Dokumentasi Tersimpan! *\n\n📌 * Judul:* ${judul} \n📅 * Tanggal:* ${tanggal} \n\n_Foto sudah masuk ke galeri dashboard! ✅_`,
+            sticker: stickerBuffer,
           });
-          console.log(`✅ Dokumentasi disimpan: "${judul}"`);
+
+          console.log(`✅ Stiker terkirim ke ${senderNomor}`);
+        }
+
+        // ═══════════════════════════════════
+        // 🖼️ DOKUMENTASI (MULTI-FOTO SUPPORT)
+        // ═══════════════════════════════════
+        else if (isDokumentasi || (pendingDokumentasi.has(senderJid) && !isAbsen && !isJurnal && !isSakit && !isIzin && !isStiker)) {
+          let state = pendingDokumentasi.get(senderJid);
+
+          // Jika user mengirim perintah lain saat masih pending, abaikan perintah lama
+          if (isDokumentasi && state) {
+             clearTimeout(state.timer);
+             pendingDokumentasi.delete(senderJid);
+             state = null;
+          }
+
+          // Jika ini foto pertama (ada caption)
+          if (isDokumentasi && !state) {
+            const dokMatch =
+              captionAsli.match(/dokumentasi\s+(\d+)?\s*(.*)/i) ||
+              captionAsli.match(/dokum\s+(\d+)?\s*(.*)/i);
+            
+            const target = dokMatch && dokMatch[1] ? parseInt(dokMatch[1], 10) : 1;
+            const judul = dokMatch && dokMatch[2] ? dokMatch[2].trim() : `Dokumentasi ${tanggal}`;
+            
+            state = { target, current: 0, judul, tanggal, buffers: [], timer: null };
+            if (target > 1) {
+              pendingDokumentasi.set(senderJid, state);
+            }
+          }
+
+          if (state) {
+            state.buffers.push(imageBuffer);
+            state.current++;
+
+            if (state.timer) clearTimeout(state.timer);
+
+            if (state.current < state.target) {
+              // Set timeout 60 detik jika user tidak melanjutkan pengiriman
+              state.timer = setTimeout(async () => {
+                pendingDokumentasi.delete(senderJid);
+                await sock.sendMessage(senderJid, {
+                  text: `⏳ *Batal Otomatis!*\n\nWaktu unggah dokumentasi habis karena kamu hanya mengirim ${state.current} dari ${state.target} foto yang diminta.\nSilakan ulangi dari awal.`
+                });
+              }, 60 * 1000);
+
+              await sock.sendMessage(senderJid, {
+                text: `📸 *Foto ${state.current}/${state.target} diterima!*\n\nSilakan kirim ${state.target - state.current} foto lagi (tanpa caption) untuk menyelesaikan dokumentasi *"${state.judul}"*.`
+              });
+              continue;
+            }
+          }
+
+          // Proses upload (tercapai target atau target hanya 1)
+          const judul = state ? state.judul : `Dokumentasi ${tanggal}`;
+          const buffers = state ? state.buffers : [imageBuffer];
+          
+          if (state) {
+            if (state.timer) clearTimeout(state.timer);
+            pendingDokumentasi.delete(senderJid); // bersihkan state
+          }
+
+          console.log(`🖼️ Menyimpan ${buffers.length} foto dokumentasi: "${judul}"`);
+          const dokResult = await tambahDokumentasi({ imageBuffers: buffers, judul, tanggal, pengirim: senderNomor });
+
+          if (!dokResult.success && dokResult.alreadyExists) {
+            await sock.sendMessage(senderJid, {
+              text: `⚠️ *Dokumentasi Sudah Diunggah!*\n\nKamu sudah mengunggah dokumentasi hari ini dengan judul:\n📌 *"${dokResult.existingTitle}"*\n\nDokumentasi harian hanya bisa diunggah *1 kali per hari*.`,
+            });
+            console.log(`⏩ Dokumentasi sudah ada hari ini untuk ${senderNomor}`);
+          } else {
+            await sock.sendMessage(senderJid, {
+              text: `🖼️ *Dokumentasi Tersimpan! (${buffers.length} Foto)*\n\n📌 *Judul:* ${judul}\n📅 *Tanggal:* ${tanggal}\n\n_Foto sudah masuk ke galeri dashboard! ✅_`,
+            });
+            console.log(`✅ Dokumentasi disimpan: "${judul}" (${buffers.length} foto)`);
+          }
         }
 
         // ═══════════════════════════════════
@@ -917,7 +1159,7 @@ async function startBot() {
             ]
             : "Sedang";
 
-          const jurnalResult = await tambahJurnal({ aktivitas, priority, tanggal });
+          const jurnalResult = await tambahJurnal({ aktivitas, priority, tanggal, pengirim: senderNomor });
           if (!jurnalResult.success && jurnalResult.alreadyExists) {
             await sock.sendMessage(senderJid, {
               text: `⚠️ *Jurnal Sudah Diisi!*\n\nKamu sudah mengisi jurnal hari ini:\n📌 *"${jurnalResult.existingTitle}"*\n\nJurnal hanya bisa diisi *1 kali per hari*.`,

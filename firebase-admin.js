@@ -1,6 +1,7 @@
 // Firebase Admin SDK — Koneksi ke Firebase dari Server
 const admin = require("firebase-admin");
 const path = require("path");
+const { spawn } = require("child_process");
 require("dotenv").config();
 
 let db, bucket;
@@ -44,60 +45,59 @@ function initFirebase() {
 
   console.log("✅ Firebase Admin SDK terhubung!");
 }
+
+// Helper: Kompresi gambar dengan FFmpeg (anti error di Termux)
+async function compressImage(imageBuffer, maxWidth = 1200, qscale = 2) {
+  return new Promise((resolve, reject) => {
+    const ffmpeg = spawn("ffmpeg", [
+      "-i", "pipe:0",
+      "-vf", `scale='min(${maxWidth},iw)':-2`, // -2 penting agar tinggi gambar genap (mencegah error codec mjpeg)
+      "-qscale:v", `${qscale}`,                 
+      "-f", "image2pipe",
+      "-vcodec", "mjpeg",
+      "pipe:1"
+    ]);
+
+    const chunks = [];
+    ffmpeg.stdout.on("data", (chunk) => chunks.push(chunk));
+    
+    ffmpeg.on("close", (code) => {
+      if (code === 0) resolve(Buffer.concat(chunks));
+      else reject(new Error("FFmpeg gagal kompres foto, kode: " + code));
+    });
+    ffmpeg.on("error", (err) => reject(new Error("FFmpeg error: " + err.message)));
+
+    ffmpeg.stdin.write(imageBuffer);
+    ffmpeg.stdin.end();
+  });
+}
+
 async function uploadPhotoToFirestore(imageBuffer, absenId) {
   if (!imageBuffer || imageBuffer.length === 0) return "";
   try {
-    const sharp = require("sharp");
-
     const originalSize = imageBuffer.length;
     console.log(`📷 Foto asli: ${(originalSize / 1024).toFixed(0)} KB`);
 
-    // Target: max ~730KB binary (karena base64 akan membesar 33% menjadi ~980KB)
-    // Batas absolut Firestore adalah 1MB per dokumen.
-    let compressed;
-    let quality = 90; // Kualitas tinggi (HD)
-    let width = 1600; // Resolusi HD
+    // Menggunakan FFmpeg untuk kompresi awal (Kualitas Max)
+    let compressed = await compressImage(imageBuffer, 1200, 2);
 
-    compressed = await sharp(imageBuffer)
-      .resize({ width, withoutEnlargement: true })
-      .jpeg({ quality, mozjpeg: true }) // mozjpeg for better compression
-      .toBuffer();
-
-    // Jika ukuran base64 akan melebihi batas aman (binary > 730KB), turunkan perlahan
+    // Fallback darurat jika ukuran melebihi batas aman Firestore (1MB limit -> max ~730KB binary)
     if (compressed.length > 730 * 1024) {
-      compressed = await sharp(imageBuffer)
-        .resize({ width: 1200, withoutEnlargement: true })
-        .jpeg({ quality: 85, mozjpeg: true })
-        .toBuffer();
+      console.log(`⚠️ Ukuran terlalu besar (${(compressed.length/1024).toFixed(0)} KB), mencoba kompresi level 2...`);
+      compressed = await compressImage(imageBuffer, 1000, 5);
+    }
+    if (compressed.length > 730 * 1024) {
+      console.log(`⚠️ Ukuran masih besar (${(compressed.length/1024).toFixed(0)} KB), mencoba kompresi level 3...`);
+      compressed = await compressImage(imageBuffer, 800, 10);
     }
 
-    if (compressed.length > 730 * 1024) {
-      compressed = await sharp(imageBuffer)
-        .resize({ width: 1000, withoutEnlargement: true })
-        .jpeg({ quality: 75, mozjpeg: true })
-        .toBuffer();
-    }
-
-    // Fallback darurat jika foto masih sangat besar
-    if (compressed.length > 730 * 1024) {
-      compressed = await sharp(imageBuffer)
-        .resize({ width: 800, withoutEnlargement: true })
-        .jpeg({ quality: 65, mozjpeg: true })
-        .toBuffer();
-    }
-
-    console.log(`✅ Foto terkompresi: ${(compressed.length / 1024).toFixed(0)} KB`);
+    console.log(`✅ Foto terkompresi (FFmpeg): ${(compressed.length / 1024).toFixed(0)} KB`);
 
     const base64 = "data:image/jpeg;base64," + compressed.toString("base64");
 
-    // Simpan ke koleksi dashboard — satu dokumen per foto
-    await db.collection("dashboard").doc("photo_" + String(absenId)).set({
-      photoData: base64,
-      uploadedAt: Date.now(),
-      originalSizeKB: Math.round(originalSize / 1024),
-      compressedSizeKB: Math.round(compressed.length / 1024),
-    });
-    return "photo_" + String(absenId); // return ID sebagai referensi
+    // Kembalikan base64 secara langsung ke array absenHistory 
+    // agar dashboard web bisa langsung menampilkan foto.
+    return base64;
   } catch (e) {
     console.warn("⚠️  Gagal simpan foto absen:", e.message);
     return "";
@@ -155,26 +155,58 @@ async function tambahAbsen({ photoBuffer, photoUrl, pengirim, jam, tanggal, hari
 // =====================================================
 // Tambah Dokumentasi ke Firestore (base64 — gratis!)
 // =====================================================
-async function tambahDokumentasi({ imageBuffer, judul, tanggal }) {
-  // Compress & convert ke base64 (sama seperti yang dilakukan React app)
-  const base64 = "data:image/jpeg;base64," + imageBuffer.toString("base64");
+async function tambahDokumentasi({ imageBuffers, judul, tanggal, pengirim }) {
+  // Cek apakah sudah ada dokumentasi hari ini dari pengirim yang sama
+  const docRef = db.collection("dokumentasi_pkl");
+  const snap = await docRef.where("date", "==", tanggal).where("pengirim", "==", pengirim).get();
+  if (!snap.empty) {
+    const existingData = snap.docs[0].data();
+    return { success: false, alreadyExists: true, existingTitle: existingData.title };
+  }
 
-  const newPhoto = {
-    id: Date.now(),
-    url: base64,
-    title: judul || "Dokumentasi PKL",
-    date: tanggal,
-  };
+  // Handle single buffer (backward compatibility) or array of buffers
+  const buffers = Array.isArray(imageBuffers) ? imageBuffers : [imageBuffers];
+  const total = buffers.length;
 
-  // Simpan ke koleksi dokumentasi_pkl (sama persis dengan React app)
-  await db.collection("dokumentasi_pkl").add(newPhoto);
+  for (let i = 0; i < total; i++) {
+    const buffer = buffers[i];
+    
+    // Gunakan kompresi FFmpeg agar dokumentasi tidak membuat DB penuh atau error
+    let compressedBuffer = buffer;
+    try {
+      compressedBuffer = await compressImage(buffer, 1200, 2);
+      if (compressedBuffer.length > 730 * 1024) {
+        compressedBuffer = await compressImage(buffer, 1000, 5);
+      }
+      if (compressedBuffer.length > 730 * 1024) {
+        compressedBuffer = await compressImage(buffer, 800, 10);
+      }
+      console.log(`✅ Dokumentasi ${i+1}/${total} dikompresi: ${(compressedBuffer.length / 1024).toFixed(0)} KB`);
+    } catch(e) {
+      console.warn("⚠️ Gagal kompresi dokumentasi, memakai ukuran asli.");
+    }
+
+    const base64 = "data:image/jpeg;base64," + compressedBuffer.toString("base64");
+    const photoTitle = total > 1 ? `${judul || "Dokumentasi PKL"} (${i + 1}/${total})` : (judul || "Dokumentasi PKL");
+
+    const newPhoto = {
+      id: Date.now() + i, // ensure unique ID
+      url: base64,
+      title: photoTitle,
+      date: tanggal,
+      pengirim: pengirim || "Unknown",
+    };
+
+    await docRef.add(newPhoto);
+  }
+
   return { success: true };
 }
 
 // =====================================================
 // Tambah Jurnal ke Firestore
 // =====================================================
-async function tambahJurnal({ aktivitas, priority, tanggal }) {
+async function tambahJurnal({ aktivitas, priority, tanggal, pengirim }) {
   const docRef = db.collection("dashboard").doc("jurnalHistory");
   const snap = await docRef.get();
 
@@ -184,12 +216,13 @@ async function tambahJurnal({ aktivitas, priority, tanggal }) {
     status: "Menunggu",
     date: tanggal,
     priority: priority || "Sedang",
+    pengirim: pengirim || "Unknown",
   };
 
   if (snap.exists) {
     const currentData = snap.data().data || [];
-    // Cek apakah sudah ada jurnal hari ini
-    const sudahJurnal = currentData.find((item) => item.date === tanggal);
+    // Cek apakah sudah ada jurnal hari ini dari pengirim yang sama
+    const sudahJurnal = currentData.find((item) => item.date === tanggal && item.pengirim === pengirim);
     if (sudahJurnal) {
       return { success: false, alreadyExists: true, existingTitle: sudahJurnal.title };
     }
@@ -204,7 +237,7 @@ async function tambahJurnal({ aktivitas, priority, tanggal }) {
 // =====================================================
 // Tambah Tugas PKL ke Firestore
 // =====================================================
-async function tambahTugas({ judul, priority, tanggal }) {
+async function tambahTugas({ judul, priority, tanggal, pengirim }) {
   const docRef = db.collection("dashboard").doc("tugasHistory");
   const snap = await docRef.get();
 
@@ -214,10 +247,16 @@ async function tambahTugas({ judul, priority, tanggal }) {
     status: "Menunggu",
     date: tanggal,
     priority: priority || "Sedang",
+    pengirim: pengirim || "Unknown",
   };
 
   if (snap.exists) {
     const currentData = snap.data().data || [];
+    // Cek apakah sudah ada tugas hari ini dari pengirim yang sama
+    const sudahTugas = currentData.find((item) => item.date === tanggal && item.pengirim === pengirim);
+    if (sudahTugas) {
+      return { success: false, alreadyExists: true, existingTitle: sudahTugas.title };
+    }
     await docRef.update({ data: [newTask, ...currentData] });
   } else {
     await docRef.set({ data: [newTask] });
